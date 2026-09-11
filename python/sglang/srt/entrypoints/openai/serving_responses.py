@@ -38,6 +38,7 @@ from openai.types.responses.response_reasoning_summary_part_done_event import (
 )
 from openai_harmony import Message as OpenAIMessage
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.entrypoints.context import (
     ConversationContext,
     HarmonyContext,
@@ -195,6 +196,16 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         self.background_tasks: dict[str, asyncio.Task] = {}
 
+        self.disaggregation_mode = self.tokenizer_manager.disaggregation_mode
+        # A prefill node's Responses bookkeeping is unreachable by construction:
+        # the PD router discards its reply and sends every retrieval call
+        # (/v1/responses/{id}, cancel, delete) to decode. Writing it anyway
+        # grows the two unbounded dicts above for the lifetime of the process,
+        # one entry per request, with nothing that can ever read or evict them.
+        self.enable_response_store = (
+            self.disaggregation_mode != DisaggregationMode.PREFILL
+        )
+
     @staticmethod
     def _has_response_tool(request: ResponsesRequest, *tool_types: str) -> bool:
         return any(tool.type in tool_types for tool in (request.tools or []))
@@ -283,6 +294,24 @@ class OpenAIServingResponses(OpenAIServingChat):
                 "SGLang server to enable native Exa-backed web search, or "
                 "configure a browser MCP tool server. Create an Exa API key at "
                 "https://dashboard.exa.ai/api-keys."
+            )
+        # Every built-in tool call costs one more generation (see
+        # ``_generate_with_builtin_tools``), but a PD router dispatches exactly
+        # one prefill/decode pair per HTTP request. The continuation would reach
+        # the decode engine with no prefill peer to hand it KV, so refuse here
+        # rather than after the first turn has already been streamed.
+        if (
+            self.use_harmony
+            and self.tool_server is not None
+            and self.disaggregation_mode != DisaggregationMode.NULL
+            and self._has_response_tool(
+                request, "web_search", "web_search_preview", "code_interpreter"
+            )
+        ):
+            return self.create_error_response(
+                "built-in tools (web_search, code_interpreter) are not supported "
+                "with prefill-decode disaggregation",
+                param="tools",
             )
 
         # Handle the previous response ID
@@ -495,7 +524,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             (result_generator,) = generators
 
             # Store the input messages
-            if request.store:
+            if request.store and self.enable_response_store:
                 self.msg_store[request.request_id] = messages
 
             if request.background and not request.stream:
@@ -757,7 +786,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             usage=usage,
         )
 
-        if request.store:
+        if request.store and self.enable_response_store:
             async with self.response_store_lock:
                 stored_response = self.response_store.get(response.id)
                 # If the response is already cancelled, don't update it
@@ -2531,7 +2560,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             status=self._status_from_finish_reason(finish_reason),
             usage=usage,
         )
-        if request.store:
+        if request.store and self.enable_response_store:
             async with self.response_store_lock:
                 stored = self.response_store.get(final_response.id)
                 if stored is None or stored.status != "cancelled":
@@ -2575,6 +2604,18 @@ class OpenAIServingResponses(OpenAIServingChat):
             if not context.need_builtin_tool_call():
                 # The model did not ask for a tool call, so we're done.
                 break
+
+            # Unreachable for a request that declared its built-in tools:
+            # ``create_responses`` rejects those up front under PD. A model that
+            # calls a tool it was never given one for still lands here, and a
+            # continuation built below would carry no usable bootstrap metadata
+            # — the decode engine would either fault on a null bootstrap_room or
+            # block until the disaggregation timeout. Fail loudly instead.
+            if self.disaggregation_mode != DisaggregationMode.NULL:
+                raise ValueError(
+                    "built-in tool calls are not supported with prefill-decode "
+                    "disaggregation"
+                )
 
             # Call the tool and update the context with the result.
             tool_output = await context.call_tool()

@@ -25,6 +25,7 @@ import json
 from typing import AsyncIterator
 from unittest.mock import Mock
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.entrypoints.openai.protocol import RequestResponseMetadata
 from sglang.srt.entrypoints.openai.serving_responses import OpenAIServingResponses
 from sglang.srt.runtime_context import get_context, publish
@@ -66,6 +67,9 @@ class MockTokenizerManager:
         self.num_reserved_tokens = 0
         self.generate_request = Mock()
         self.create_abort_task = Mock()
+        # Real TokenizerManager resolves this in __init__; the serving layer
+        # reads it to decide what a prefill node may store.
+        self.disaggregation_mode = DisaggregationMode.NULL
 
     def config_value(self, name: str):
         """The value in effect for one config field."""
@@ -84,15 +88,19 @@ class MockTemplateManager:
         self.jinja_template_may_reorder_tool_results = False
 
 
-def make_serving(*, is_multimodal: bool = False) -> OpenAIServingResponses:
+def make_serving(
+    *,
+    is_multimodal: bool = False,
+    disaggregation_mode: DisaggregationMode = DisaggregationMode.NULL,
+) -> OpenAIServingResponses:
     """The serving layer reads its config from the bags, so the fixture
     publishes one. Idempotent: a caller that already published keeps its own,
     which is how a test states a value the default record does not carry."""
     if not get_context().is_config_namespace_published("serving"):
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
-    return OpenAIServingResponses(
-        MockTokenizerManager(is_multimodal=is_multimodal), MockTemplateManager()
-    )
+    tokenizer_manager = MockTokenizerManager(is_multimodal=is_multimodal)
+    tokenizer_manager.disaggregation_mode = disaggregation_mode
+    return OpenAIServingResponses(tokenizer_manager, MockTemplateManager())
 
 
 async def collect_stream_events(stream: AsyncIterator[str]) -> list[str]:

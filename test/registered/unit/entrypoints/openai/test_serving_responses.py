@@ -1,6 +1,6 @@
 import asyncio
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from openai.types.responses import (
     ResponseOutputMessage,
@@ -10,6 +10,7 @@ from openai.types.responses import (
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
 from utils import make_serving
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.entrypoints.context import SimpleContext
 from sglang.srt.entrypoints.openai.protocol import (
     MessageProcessingResult,
@@ -1090,6 +1091,146 @@ class StreamingLogprobsRejectionTestCase(CustomTestCase):
         self.assertEqual(result.status_code, 400)
         body = orjson.loads(result.body)
         self.assertIn("streaming mode", body["error"]["message"])
+
+
+class DisaggregationResponseStoreTestCase(CustomTestCase):
+    """In PD the prefill node's reply is discarded by the router and every
+    retrieval call goes to decode, so anything it stores can never be read —
+    and ``response_store``/``msg_store`` have no eviction."""
+
+    def _run_one_response(self, serving):
+        serving.default_chat_template_kwargs = {}
+        serving.template_manager.chat_template_name = None
+
+        async def fake_generate(
+            request_id,
+            request_prompt,
+            adapted_request,
+            sampling_params,
+            context,
+            **kwargs,
+        ):
+            context.append_output(
+                {
+                    "text": "ok",
+                    "meta_info": {
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "cached_tokens": 0,
+                    },
+                }
+            )
+            yield context
+
+        serving._generate_with_builtin_tools = fake_generate
+        # store defaults to True, which is what a PD router forwards to both legs.
+        request = ResponsesRequest(model="x", input="hi")
+        asyncio.run(serving.create_responses(request))
+
+    def test_prefill_node_stores_nothing(self):
+        serving = make_serving(disaggregation_mode=DisaggregationMode.PREFILL)
+        self._run_one_response(serving)
+        self.assertEqual(serving.msg_store, {})
+        self.assertEqual(serving.response_store, {})
+
+    def test_decode_and_standalone_nodes_still_store(self):
+        for mode in (DisaggregationMode.NULL, DisaggregationMode.DECODE):
+            with self.subTest(mode=mode):
+                serving = make_serving(disaggregation_mode=mode)
+                self._run_one_response(serving)
+                self.assertEqual(len(serving.msg_store), 1, mode)
+                self.assertEqual(len(serving.response_store), 1, mode)
+
+
+class DisaggregationBuiltinToolsTestCase(CustomTestCase):
+    """Each built-in tool call costs another generation, but a PD router
+    dispatches one prefill/decode pair per HTTP request, so the continuation
+    would have no prefill peer."""
+
+    @staticmethod
+    def _harmony_serving(mode):
+        serving = make_serving(disaggregation_mode=mode)
+        serving.use_harmony = True
+        serving.tool_server = Mock()
+        serving.supports_browsing = True
+        serving.supports_code_interpreter = True
+        return serving
+
+    def test_builtin_tool_request_rejected_under_disaggregation(self):
+        import orjson
+
+        from sglang.srt.entrypoints.openai.protocol import ResponseTool
+
+        for mode in (DisaggregationMode.PREFILL, DisaggregationMode.DECODE):
+            with self.subTest(mode=mode):
+                serving = self._harmony_serving(mode)
+                request = ResponsesRequest(
+                    model="x",
+                    input="hi",
+                    store=False,
+                    tools=[ResponseTool(type="web_search")],
+                )
+                result = asyncio.run(serving.create_responses(request))
+                self.assertEqual(result.status_code, 400)
+                body = orjson.loads(result.body)
+                self.assertIn("disaggregation", body["error"]["message"])
+
+    def test_builtin_tool_request_allowed_without_disaggregation(self):
+        """Same request and same harmony + tool-server setup: only the
+        disaggregation mode may decide this, so a standalone server still gets
+        past validation and into generation."""
+        from sglang.srt.entrypoints.openai.protocol import ResponseTool
+
+        serving = self._harmony_serving(DisaggregationMode.NULL)
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            store=False,
+            tools=[ResponseTool(type="web_search")],
+        )
+
+        # Stub the two hops past validation: rendering real harmony prompts from
+        # a mocked tool server, and the generation itself, are not under test.
+        serving._make_request_with_harmony = Mock(
+            return_value=(["msg"], [[1, 2, 3]], [[1, 2, 3]])
+        )
+        sentinel = object()
+        serving.responses_full_generator = AsyncMock(return_value=sentinel)
+
+        result = asyncio.run(serving.create_responses(request))
+        self.assertIs(
+            result, sentinel, "NULL mode must not be rejected before generation"
+        )
+
+    def test_tool_continuation_refused_instead_of_building_a_peerless_request(self):
+        """Backstop for a model that calls a tool the request never declared:
+        without it the continuation reaches decode with no bootstrap metadata."""
+        serving = make_serving(disaggregation_mode=DisaggregationMode.DECODE)
+
+        async def empty_stream(*args, **kwargs):
+            return
+            yield  # pragma: no cover - makes this an async generator
+
+        serving.tokenizer_manager.generate_request = empty_stream
+
+        context = Mock()
+        context.need_builtin_tool_call.return_value = True
+        context.call_tool = AsyncMock(return_value=[])
+
+        async def drive():
+            async for _ in serving._generate_with_builtin_tools(
+                request_id="resp_x",
+                request_prompt="hi",
+                adapted_request=Mock(),
+                sampling_params={},
+                context=context,
+            ):
+                pass
+
+        with self.assertRaises(ValueError) as caught:
+            asyncio.run(drive())
+        self.assertIn("disaggregation", str(caught.exception))
+        context.call_tool.assert_not_awaited()
 
 
 if __name__ == "__main__":
