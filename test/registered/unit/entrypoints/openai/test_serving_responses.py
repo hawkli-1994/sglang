@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, Mock, patch
 
 from openai.types.responses import (
@@ -1148,10 +1149,19 @@ class DisaggregationBuiltinToolsTestCase(CustomTestCase):
     would have no prefill peer."""
 
     @staticmethod
-    def _harmony_serving(mode):
+    @asynccontextmanager
+    async def _fake_tool_session(_tool_name):
+        yield Mock()
+
+    @classmethod
+    def _harmony_serving(cls, mode):
         serving = make_serving(disaggregation_mode=mode)
         serving.use_harmony = True
+        # ``create_responses`` opens one session per supported tool through
+        # ``AsyncExitStack.enter_async_context``, so this has to be a real
+        # async context manager rather than a bare Mock.
         serving.tool_server = Mock()
+        serving.tool_server.get_tool_session = cls._fake_tool_session
         serving.supports_browsing = True
         serving.supports_code_interpreter = True
         return serving
